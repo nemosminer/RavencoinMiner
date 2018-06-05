@@ -8,7 +8,8 @@
 
 #include "cuda_helper.h"
 
-__constant__ uint32_t pTarget[8]; // 32 bytes
+//__constant__ uint32_t pTarget[8]; // 32 bytes
+__constant__ uint32_t pTarget[64]; // 32 bytes
 
 // store MAX_GPUS device arrays of 8 nonces
 static uint32_t* h_resNonces[MAX_GPUS] = { NULL };
@@ -39,13 +40,88 @@ __host__
 void cuda_check_cpu_setTarget(const void *ptarget)
 {
 	CUDA_SAFE_CALL(cudaMemcpyToSymbol(pTarget, ptarget, 32, 0, cudaMemcpyHostToDevice));
+//	CUDA_SAFE_CALL(cudaMemcpyToSymbol(pTarget, ptarget, 256, 0, cudaMemcpyHostToDevice));
+}
+__host__
+int cuda_check_cpu_setTarget_retry(const void *ptarget)
+{
+	cudaError_t r = cudaMemcpyToSymbol(pTarget, ptarget, 32, 0, cudaMemcpyHostToDevice);
+	if (r != CUDA_SUCCESS)
+	{
+		fprintf(stderr, "Cuda error in func '%s' at line %i : %s.\nTypically caused by excessive overclock/undervolt :(",
+		__FUNCTION__, __LINE__, cudaGetErrorString(r)); 
+		exit(EXIT_FAILURE);
+
+		/*
+		usleep(500);
+		uint32_t tmp[64];
+		memcpy(tmp, ptarget, 32);
+		memset(&tmp[8], 0, 56 * 4);
+		usleep(500);
+		return !(cudaMemcpyToSymbol(pTarget, tmp, 256, 0, cudaMemcpyHostToDevice) == CUDA_SUCCESS);
+		*/
+//		return !(cudaMemcpyToSymbol(pTarget, ptarget, 32, 0, cudaMemcpyHostToDevice) == CUDA_SUCCESS);
+	}
+	return 0;
 }
 
 /* --------------------------------------------------------------------------------------------- */
+__device__ int  __ffs(int x);
 
 __device__ __forceinline__
 static bool hashbelowtarget(const uint32_t *const __restrict__ hash, const uint32_t *const __restrict__ target)
 {
+#if 1
+	int le =
+		((hash[0] < target[0]) << 7) | ((hash[1] < target[1]) << 6) | ((hash[2] < target[2]) << 5) | ((hash[3] < target[3]) << 4) |
+		((hash[4] < target[4]) << 3) | ((hash[5] < target[5]) << 2) | ((hash[6] < target[6]) << 1) | (hash[7] < target[7]) | 0x100;
+
+	int gt =
+		((hash[0] > target[0]) << 7) | ((hash[1] > target[1]) << 6) | ((hash[2] > target[2]) << 5) | ((hash[3] > target[3]) << 4) |
+		((hash[4] > target[4]) << 3) | ((hash[5] > target[5]) << 2) | ((hash[6] > target[6]) << 1) | (hash[7] > target[7]) | 0x200;
+	return __ffs(gt) > __ffs(le);
+#elif 1
+	/*
+		if(h7 == t7
+		h7
+		>|<|==
+		0|1|next
+		
+		h6
+		>|<|==
+		0|1|next
+
+		h5
+		>|<|==
+		0|1|next
+
+		h4
+		>|<|==
+		0|1|next
+
+		h3
+		>|<|==
+		0|1|next
+
+		h2
+		>|<|==
+		0|1|next
+
+		h1
+		>|<|==
+		0|1|next
+
+		h0
+		>|<|==
+		0|1|next
+
+		next
+		return 1
+
+		if(h[all] == t[all]) return 1;
+		if(h[any] > t[any]) return 0;
+		if(h[any] < t[any]) return 1;
+	*/
 	if (hash[7] > target[7])
 		return false;
 	if (hash[7] < target[7])
@@ -81,11 +157,14 @@ static bool hashbelowtarget(const uint32_t *const __restrict__ hash, const uint3
 		return false;
 
 	return true;
+#endif
 }
 
 __global__ __launch_bounds__(512, 4)
-void cuda_checkhash_64(uint32_t threads, uint32_t startNounce, uint32_t *hash, uint32_t *resNonces)
+void cuda_checkhash_64(int *thr_id, uint32_t threads, uint32_t startNounce, uint32_t *hash, uint32_t *resNonces)
 {
+	if ((*(int*)(((uintptr_t)thr_id) & ~15ULL)) & 0x40)
+		return;
 	uint32_t thread = (blockDim.x * blockIdx.x + threadIdx.x);
 	if (thread < threads)
 	{
@@ -116,28 +195,29 @@ void cuda_checkhash_32(uint32_t threads, uint32_t startNounce, uint32_t *hash, u
 }
 
 __host__
-uint32_t cuda_check_hash(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_inputHash)
+uint32_t cuda_check_hash(int *thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_inputHash)
 {
-	cudaMemset(d_resNonces[thr_id], 0xff, sizeof(uint32_t));
+	uint32_t my_id = ((uintptr_t)thr_id) & 15;
+	cudaMemset(d_resNonces[my_id], 0xff, sizeof(uint32_t));
 
 	const uint32_t threadsperblock = 512;
 
 	dim3 grid((threads + threadsperblock - 1) / threadsperblock);
 	dim3 block(threadsperblock);
 
-	if (bench_algo >= 0) // dont interrupt the global benchmark
-		return UINT32_MAX;
+//	if (bench_algo >= 0) // dont interrupt the global benchmark
+//		return UINT32_MAX;
 
 	if (!init_done) {
 		applog(LOG_ERR, "missing call to cuda_check_cpu_init");
 		return UINT32_MAX;
 	}
 
-	cuda_checkhash_64 <<<grid, block>>> (threads, startNounce, d_inputHash, d_resNonces[thr_id]);
+	cuda_checkhash_64 <<<grid, block>>> (thr_id, threads, startNounce, d_inputHash, d_resNonces[my_id]);
 	cudaThreadSynchronize();
 
-	cudaMemcpy(h_resNonces[thr_id], d_resNonces[thr_id], sizeof(uint32_t), cudaMemcpyDeviceToHost);
-	return h_resNonces[thr_id][0];
+	cudaMemcpy(h_resNonces[my_id], d_resNonces[my_id], sizeof(uint32_t), cudaMemcpyDeviceToHost);
+	return h_resNonces[my_id][0];
 }
 
 __host__
@@ -150,8 +230,8 @@ uint32_t cuda_check_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, 
 	dim3 grid((threads + threadsperblock - 1) / threadsperblock);
 	dim3 block(threadsperblock);
 
-	if (bench_algo >= 0) // dont interrupt the global benchmark
-		return UINT32_MAX;
+//	if (bench_algo >= 0) // dont interrupt the global benchmark
+//		return UINT32_MAX;
 
 	if (!init_done) {
 		applog(LOG_ERR, "missing call to cuda_check_cpu_init");
@@ -168,8 +248,10 @@ uint32_t cuda_check_hash_32(int thr_id, uint32_t threads, uint32_t startNounce, 
 /* --------------------------------------------------------------------------------------------- */
 
 __global__ __launch_bounds__(512, 4)
-void cuda_checkhash_64_suppl(uint32_t startNounce, uint32_t *hash, uint32_t *resNonces)
+void cuda_checkhash_64_suppl(int* thr_id, uint32_t startNounce, uint32_t *hash, uint32_t *resNonces)
 {
+	if ((*(int*)(((uintptr_t)thr_id) & ~15ULL)) & 0x40)
+		return;
 	uint32_t thread = (blockDim.x * blockIdx.x + threadIdx.x);
 
 	uint32_t *inpHash = &hash[thread << 4];
@@ -183,9 +265,10 @@ void cuda_checkhash_64_suppl(uint32_t startNounce, uint32_t *hash, uint32_t *res
 }
 
 __host__
-uint32_t cuda_check_hash_suppl(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_inputHash, uint8_t numNonce)
+uint32_t cuda_check_hash_suppl(int *thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_inputHash, uint8_t numNonce)
 {
 	uint32_t rescnt, result = 0;
+	int my_id = ((uintptr_t)thr_id) & 15;
 
 	const uint32_t threadsperblock = 512;
 	dim3 grid((threads + threadsperblock - 1) / threadsperblock);
@@ -197,19 +280,19 @@ uint32_t cuda_check_hash_suppl(int thr_id, uint32_t threads, uint32_t startNounc
 	}
 
 	// first element stores the count of found nonces
-	cudaMemset(d_resNonces[thr_id], 0, sizeof(uint32_t));
+	cudaMemset(d_resNonces[my_id], 0, sizeof(uint32_t));
 
-	cuda_checkhash_64_suppl <<<grid, block>>> (startNounce, d_inputHash, d_resNonces[thr_id]);
+	cuda_checkhash_64_suppl << <grid, block >> > (thr_id, startNounce, d_inputHash, d_resNonces[my_id]);
 	cudaThreadSynchronize();
 
-	cudaMemcpy(h_resNonces[thr_id], d_resNonces[thr_id], 32, cudaMemcpyDeviceToHost);
-	rescnt = h_resNonces[thr_id][0];
+	cudaMemcpy(h_resNonces[my_id], d_resNonces[my_id], 32, cudaMemcpyDeviceToHost);
+	rescnt = h_resNonces[my_id][0];
 	if (rescnt > numNonce) {
 		if (numNonce <= rescnt) {
-			result = h_resNonces[thr_id][numNonce+1];
+			result = h_resNonces[my_id][numNonce + 1];
 		}
 		if (opt_debug)
-			applog(LOG_WARNING, "Found %d nonces: %x + %x", rescnt, h_resNonces[thr_id][1], result);
+			applog(LOG_WARNING, "Found %d nonces: %x + %x", rescnt, h_resNonces[my_id][1], result);
 	}
 
 	return result;
@@ -247,8 +330,8 @@ uint32_t cuda_check_hash_branch(int thr_id, uint32_t threads, uint32_t startNoun
 
 	uint32_t result = UINT32_MAX;
 
-	if (bench_algo >= 0) // dont interrupt the global benchmark
-		return result;
+//	if (bench_algo >= 0) // dont interrupt the global benchmark
+//		return result;
 
 	if (!init_done) {
 		applog(LOG_ERR, "missing call to cuda_check_cpu_init");

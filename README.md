@@ -1,33 +1,48 @@
-# ccminer
+# Ravencoin Miner
 
-Based on Christian Buchner's &amp; Christian H.'s CUDA project, no more active on github since 2014.
+Kraww!
+
+An optimized fork of ccminer developed for Ravencoin.
+
+Based on Christian Buchner's &amp; Christian H.'s CUDA project, no longer active on github since 2014.
 
 Check the [README.txt](README.txt) for the additions
 
-BTC donation address: 1AJdfCpLWPNoAMDfHF1wD5y8VgKSSTHxPo (tpruvot)
 
-A part of the recent algos were originally written by [djm34](https://github.com/djm34) and [alexis78](https://github.com/alexis78)
+# Example .bat file fail over script
 
-This variant was tested and built on Linux (ubuntu server 14.04, 16.04, Fedora 22 to 25)
-It is also built for Windows 7 to 10 with VStudio 2013, to stay compatible with Windows 7 and Vista.
+This is the example .bat file provided with the miner. Feel free to use this or your own .bat file.
 
-Note that the x86 releases are generally faster than x64 ones on Windows, but that tend to change with the recent drivers.
+	:: Kraww!
+	:MINE
+	ccminer -a x16r -o stratum+tcp://ravenminer.com:3636 -u RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH -p d=8 -i 20 -r 5 -N 600
+	ccminer -a x16r -o stratum+tcp://ravenminer.com:3636 -u RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH -p d=8 -i 20 -r 3 -N 600
+	ccminer -a x16r -o stratum+tcp://ravenminer.com:3636 -u RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH -p d=8 -i 20 -r 3 -N 600
+	ccminer -a x16r -o stratum+tcp://ravenminer.com:3636 -u RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH -p d=8 -i 20 -r 3 -N 600
+	GOTO :MINE
 
-The recommended CUDA Toolkit version was the [6.5.19](http://developer.download.nvidia.com/compute/cuda/6_5/rel/installers/cuda_6.5.19_windows_general_64.exe), but some light algos could be faster with the version 7.5 and 8.0 (like lbry, decred and skein).
+- Replace the pool connection information with your preferred Ravencoin pool
+- Replace the wallet address with your own
+- Most Ravencoin pools can have anything after -p, generally it is used as a worker name
+- Set Stratum difficulty with d=X
+- Recommended difficulty setting:
+	- d=HASHRATE/2
+	- d=HASHRATE/3
+- Set Intensity with -i, default is 19
+- Set Donation % with --donate
+- Set number of times miner will try to reconnect to pool before moving to next connection in script with -r
+- -N 600 Makes the mining program use 600 shares in the calculation of the average hash rate that is displayed on Accepted share lines
+- This has the effect of stabilizing the displayed hash rate
 
-About source code dependencies
-------------------------------
 
-This project requires some libraries to be built :
 
-- OpenSSL (prebuilt for win)
-- Curl (prebuilt for win)
-- pthreads (prebuilt for win)
+## Donation Addresses
 
-The tree now contains recent prebuilt openssl and curl .lib for both x86 and x64 platforms (windows).
+Consider supporting the contributors to this miner by donating to the following addresses:
 
-To rebuild them, you need to clone this repository and its submodules :
-    git clone https://github.com/peters/curl-for-windows.git compat/curl-for-windows
+- RVN: RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH
+
+Built from source on Windows 10.
 
 
 Compile on Linux

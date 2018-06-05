@@ -200,7 +200,7 @@ void x15_whirlpool_cpu_init(int thr_id, uint32_t threads, int mode)
 
 	CUDA_SAFE_CALL(cudaMalloc(&d_resNonce[thr_id], 2 * sizeof(uint32_t)));
 
-	cuda_get_arch(thr_id);
+//	cuda_get_arch(thr_id); // must be called
 }
 
 __host__
@@ -619,8 +619,10 @@ void whirlpool512_cpu_hash_80(int thr_id, uint32_t threads, uint32_t startNounce
 
 __global__
 __launch_bounds__(TPB64,2)
-void x15_whirlpool_gpu_hash_64(uint32_t threads, uint64_t *g_hash)
+void x15_whirlpool_gpu_hash_64(int *thr_id, uint32_t threads, uint64_t *g_hash)
 {
+	if ((*(int*)(((uintptr_t)thr_id) & ~15ULL)) & 0x40)
+		return;
 	__shared__ uint2 sharedMemory[7][256];
 
 	if (threadIdx.x < 256) {
@@ -646,7 +648,7 @@ void x15_whirlpool_gpu_hash_64(uint32_t threads, uint64_t *g_hash)
 		*(uint2x4*)&hash[ 0] = __ldg4((uint2x4*)&g_hash[(thread<<3) + 0]);
 		*(uint2x4*)&hash[ 4] = __ldg4((uint2x4*)&g_hash[(thread<<3) + 4]);
 
-		__syncthreads();
+//		__syncthreads();
 
 		#pragma unroll 8
 		for(int i=0;i<8;i++)
@@ -725,7 +727,7 @@ void x15_whirlpool_gpu_hash_64(uint32_t threads, uint64_t *g_hash)
 		*(uint2x4*)&g_hash[(thread<<3)+ 4] = *(uint2x4*)&hash[ 4];
 	}
 }
-
+/*
 __host__
 static void x15_whirlpool_cpu_hash_64(int thr_id, uint32_t threads, uint32_t *d_hash)
 {
@@ -734,10 +736,13 @@ static void x15_whirlpool_cpu_hash_64(int thr_id, uint32_t threads, uint32_t *d_
 
 	x15_whirlpool_gpu_hash_64 <<<grid, block>>> (threads, (uint64_t*)d_hash);
 }
-
+*/
 __host__
-void x15_whirlpool_cpu_hash_64(int thr_id, uint32_t threads, uint32_t startNounce, uint32_t *d_nonceVector, uint32_t *d_hash, int order)
+void x15_whirlpool_cpu_hash_64(int *thr_id, uint32_t threads, uint32_t *d_hash)
 {
-	x15_whirlpool_cpu_hash_64(thr_id, threads, d_hash);
-}
+	dim3 grid((threads + TPB64 - 1) / TPB64);
+	dim3 block(TPB64);
 
+	x15_whirlpool_gpu_hash_64 << <grid, block >> > (thr_id, threads, (uint64_t*)d_hash);
+	//	x15_whirlpool_cpu_hash_64(thr_id, threads, d_hash);
+}

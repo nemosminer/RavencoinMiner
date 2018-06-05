@@ -1,4 +1,4 @@
-AC_INIT([ccminer], [2.2.5], [], [ccminer], [http://github.com/tpruvot/ccminer])
+AC_INIT([Ravencoin Miner], [2.6], [], [Ravencoin Miner], [https://github.com/Ravencoin-Miner/Ravencoin])
 
 AC_PREREQ([2.59c])
 AC_CANONICAL_SYSTEM
@@ -157,6 +157,6 @@ AC_SUBST(CUDA_LIBS)
 AC_SUBST(CUDA_LDFLAGS)
 AC_SUBST(NVCC)
 
-AC_SUBST(OPENMP_CFLAGS) 
+AC_SUBST(OPENMP_CFLAGS)
 
 AC_OUTPUT

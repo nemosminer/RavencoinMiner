@@ -45,6 +45,7 @@
 #include "sia/sia-rpc.h"
 #include "crypto/xmr-rpc.h"
 #include "equi/equihash.h"
+#include "donate.h"
 
 #include <cuda_runtime.h>
 
@@ -55,7 +56,7 @@
 BOOL WINAPI ConsoleHandler(DWORD);
 #endif
 
-#define PROGRAM_NAME		"ccminer"
+#define PROGRAM_NAME		"Ravencoin Miner"
 #define LP_SCANTIME		60
 #define HEAVYCOIN_BLKHDR_SZ		84
 #define MNR_BLKHDR_SZ 80
@@ -105,12 +106,14 @@ bool use_colors = true;
 int use_pok = 0;
 static bool opt_background = false;
 bool opt_quiet = false;
-int opt_maxlograte = 3;
+int opt_maxlograte = 60;
 static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_time_limit = -1;
 int opt_shares_limit = -1;
 time_t firstwork_time = 0;
+time_t dev_timestamp;
+time_t dev_timestamp_offset;
 int opt_timeout = 300; // curl
 int opt_scantime = 10;
 static json_t *opt_config;
@@ -163,6 +166,7 @@ char *jane_params = NULL;
 struct pool_infos pools[MAX_POOLS] = { 0 };
 int num_pools = 1;
 volatile int cur_pooln = 0;
+volatile int prev_pooln = 0;
 bool opt_pool_failover = true;
 volatile bool pool_on_hold = false;
 volatile bool pool_is_switching = false;
@@ -215,6 +219,13 @@ double opt_resume_rate = -1.;
 
 int opt_statsavg = 30;
 
+bool opt_eco_mode = false;
+bool allow_getwork = true;
+static unsigned char pk_script[25] = { 0 };
+static size_t pk_script_size = 0;
+static char *lp_id;
+bool opt_segwit_mode = false;
+
 #define API_MCAST_CODE "FTW"
 #define API_MCAST_ADDR "224.0.0.75"
 
@@ -231,6 +242,10 @@ char *opt_api_mcast_des = strdup("");
 int opt_api_mcast_port = 4068;
 
 bool opt_stratum_stats = false;
+
+double dev_donate_percent = MIN_DEV_DONATE_PERCENT;
+int rvncounter = 0;
+int ravencolorcounter = 0;
 
 static char const usage[] = "\
 Usage: " PROGRAM_NAME " [OPTIONS]\n\
@@ -290,12 +305,10 @@ Options:\n\
 			whirlpool   Whirlpool algo\n\
 			x11evo      Permuted x11 (Revolver)\n\
 			x11         X11 (DarkCoin)\n\
-			x12         X12 (GalaxyCash)\n\
 			x13         X13 (MaruCoin)\n\
 			x14         X14\n\
 			x15         X15\n\
 			x16r        X16R (Raven)\n\
-			x16s        X16S\n\
 			x17         X17\n\
 			wildkeccak  Boolberry\n\
 			zr5         ZR5 (ZiftrCoin)\n\
@@ -305,6 +318,7 @@ Options:\n\
                         (matching 2nd gt640 in the PC)\n\
   -i  --intensity=N[,N] GPU intensity 8.0-25.0 (default: auto) \n\
                         Decimals are allowed for fine tuning \n\
+      --eco             Use Eco mode\n\
       --cuda-schedule   Set device threads scheduling mode (default: auto)\n\
   -f, --diff-factor     Divide difficulty by this factor (default 1.0) \n\
   -m, --diff-multiplier Multiply difficulty by this value (default 1.0) \n\
@@ -323,9 +337,12 @@ Options:\n\
   -T, --timeout=N       network timeout, in seconds (default: 300)\n\
   -s, --scantime=N      upper bound on time spent scanning current work when\n\
                           long polling is unavailable, in seconds (default: 10)\n\
+	      --segwit          Agree with Segwit (Solo Mining only)\n\
       --submit-stale    ignore stale jobs checks, may create more rejected shares\n\
   -n, --ndevs           list cuda devices\n\
   -N, --statsavg        number of samples used to compute hashrate (default: 30)\n\
+      --coinbase-addr=ADDR  payout address for solo mining\n\
+      --no-getwork      disable getwork support\n\
       --no-gbt          disable getblocktemplate support (height check in solo)\n\
       --no-longpoll     disable X-Long-Polling support\n\
       --no-stratum      disable X-Stratum support\n\
@@ -369,6 +386,7 @@ Options:\n\
   -B, --background      run the miner in the background\n\
       --benchmark       run in offline benchmark mode\n\
       --cputest         debug hashes from cpu algorithms\n\
+      --donate          percentage of time to donate to dev\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
   -V, --version         display version information and exit\n\
   -h, --help            display this help text and exit\n\
@@ -400,6 +418,7 @@ struct option options[] = {
 	{ "cpu-priority", 1, NULL, 1021 },
 	{ "cuda-schedule", 1, NULL, 1025 },
 	{ "debug", 0, NULL, 'D' },
+	{ "donate", 1, NULL, 1081 },
 	{ "help", 0, NULL, 'h' },
 	{ "intensity", 1, NULL, 'i' },
 	{ "ndevs", 0, NULL, 'n' },
@@ -466,6 +485,10 @@ struct option options[] = {
 	{ "diff-multiplier", 1, NULL, 'm' },
 	{ "diff-factor", 1, NULL, 'f' },
 	{ "diff", 1, NULL, 'f' }, // compat
+	{ "coinbase-addr", 1, NULL, 1016 },
+	{ "no-getwork", 0, NULL, 1010 },
+	{ "eco", 0, NULL, 1082 },
+	{ "segwit", 0, NULL, 1083 },
 	{ 0, 0, 0, 0 }
 };
 
@@ -575,9 +598,11 @@ void get_currentalgo(char* buf, int sz)
 
 void format_hashrate(double hashrate, char *output)
 {
+#if 0
 	if (opt_algo == ALGO_EQUIHASH)
 		format_hashrate_unit(hashrate, output, "Sol/s");
 	else
+#endif
 		format_hashrate_unit(hashrate, output, "H/s");
 }
 
@@ -661,6 +686,7 @@ static void calc_network_diff(struct work *work)
 	// sample for diff 43.281 : 1c05ea29
 	// todo: endian reversed on longpoll could be zr5 specific...
 	uint32_t nbits = have_longpoll ? work->data[18] : swab32(work->data[18]);
+#if 0
 	if (opt_algo == ALGO_LBRY) nbits = swab32(work->data[26]);
 	if (opt_algo == ALGO_DECRED) nbits = work->data[29];
 	if (opt_algo == ALGO_SIA) nbits = work->data[11]; // unsure if correct
@@ -668,18 +694,30 @@ static void calc_network_diff(struct work *work)
 		net_diff = equi_network_diff(work);
 		return;
 	}
-
+#endif
 	uint32_t bits = (nbits & 0xffffff);
 	int16_t shift = (swab32(nbits) & 0xff); // 0x1c = 28
 
 	uint64_t diffone = 0x0000FFFF00000000ull;
+
 	double d = (double)0x0000ffff / (double)bits;
 
 	for (int m=shift; m < 29; m++) d *= 256.0;
 	for (int m=29; m < shift; m++) d /= 256.0;
-	if (opt_algo == ALGO_DECRED && shift == 28) d *= 256.0;
+
+	
+/*	
+	uint32_t d = 0x0000ffff / bits;
+
+	for (int m = shift; m < 29; m++) d <<= 8;
+	for (int m = 29; m < shift; m++) d >>= 8;
+*/
+
+
+	//	if (opt_algo == ALGO_DECRED && shift == 28) d *= 256.0;
 	if (opt_debug_diff)
-		applog(LOG_DEBUG, "net diff: %f -> shift %u, bits %08x", d, shift, bits);
+		applog(LOG_DEBUG, "net diff: %u -> shift %u, bits %08x", d, shift, bits);
+//		applog(LOG_DEBUG, "net diff: %f -> shift %u, bits %08x", d, shift, bits);
 
 	net_diff = d;
 }
@@ -690,8 +728,9 @@ static bool work_decode(const json_t *val, struct work *work)
 	int data_size, target_size = sizeof(work->target);
 	int adata_sz, atarget_sz = ARRAY_SIZE(work->target);
 	int i;
-
+#if 0
 	switch (opt_algo) {
+		
 	case ALGO_DECRED:
 		data_size = 192;
 		adata_sz = 180/4;
@@ -706,9 +745,10 @@ static bool work_decode(const json_t *val, struct work *work)
 	case ALGO_WILDKECCAK:
 		return rpc2_job_decode(val, work);
 	default:
+#endif
 		data_size = 128;
 		adata_sz = data_size / 4;
-	}
+//	}
 
 	if (!jobj_binary(val, "data", work->data, data_size)) {
 		json_t *obj = json_object_get(val, "data");
@@ -729,13 +769,14 @@ static bool work_decode(const json_t *val, struct work *work)
 		applog(LOG_ERR, "JSON invalid target");
 		return false;
 	}
-
+#if 0
 	if (opt_algo == ALGO_HEAVY) {
 		if (unlikely(!jobj_binary(val, "maxvote", &work->maxvote, sizeof(work->maxvote)))) {
 			work->maxvote = 2048;
 		}
 	} else work->maxvote = 0;
-
+#endif
+			work->maxvote = 0;
 	for (i = 0; i < adata_sz; i++)
 		work->data[i] = le32dec(work->data + i);
 	for (i = 0; i < atarget_sz; i++)
@@ -750,6 +791,7 @@ static bool work_decode(const json_t *val, struct work *work)
 	stratum_diff = work->targetdiff;
 
 	work->tx_count = use_pok = 0;
+#if 0
 	if (opt_algo == ALGO_ZR5 && work->data[0] & POK_BOOL_MASK) {
 		use_pok = 1;
 		json_t *txs = json_object_get(val, "txs");
@@ -778,10 +820,10 @@ static bool work_decode(const json_t *val, struct work *work)
 				applog(LOG_DEBUG, "block txs: %u, total len: %u", work->tx_count, totlen);
 		}
 	}
-
+#endif
 	/* use work ntime as job id (solo-mining) */
 	cbin2hex(work->job_id, (const char*)&work->data[17], 4);
-
+#if 0
 	if (opt_algo == ALGO_DECRED) {
 		uint16_t vote;
 		// always keep last bit of votebits
@@ -807,11 +849,11 @@ static bool work_decode(const json_t *val, struct work *work)
 		}
 		cbin2hex(work->job_id, (const char*)&work->data[34], 4);
 	}
-
+#endif
 	return true;
 }
 
-#define YES "yes!"
+#define YES "Kraww!"
 #define YAY "yay!!!"
 #define BOO "booooo"
 
@@ -822,7 +864,9 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
 	char solved[16] = { 0 };
 	char s[32] = { 0 };
 	double hashrate = 0.;
+	double RVN = 0.0;
 	struct pool_infos *p = &pools[pooln];
+	
 
 	pthread_mutex_lock(&stats_lock);
 	for (int i = 0; i < opt_n_threads; i++) {
@@ -839,7 +883,7 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
 	global_hashrate = llround(hashrate);
 
 	format_hashrate(hashrate, s);
-	if (opt_showdiff)
+	if (!opt_showdiff)
 		sprintf(suppl, "diff %.3f", sharediff);
 	else // accepted percent
 		sprintf(suppl, "%.2f%%", 100. * p->accepted_count / (p->accepted_count + p->rejected_count));
@@ -856,10 +900,44 @@ int share_result(int result, int pooln, double sharediff, const char *reason)
 		sprintf(solved, " solved: %u", p->solved_count);
 	}
 
-	applog(LOG_NOTICE, "accepted: %lu/%lu (%s), %s %s%s",
+	applog(LOG_NOTICE, "	Accepted: %lu/%lu (%s), %s %s%s",
 			p->accepted_count,
 			p->accepted_count + p->rejected_count,
 			suppl, s, flag, solved);
+			
+	/* 
+	-Display estimated RVN/day every 5 shares (conservative, made to match ravencalc.xyz)		
+	-Can color RVN/day by editing default CMD window colors
+	-Color definitions are in miner.h
+	-Ravencoin Blue (56,65,130)
+	-Ravencoin Red (240,82,57)
+	-Ravencoin Orange (247,148,51)
+	*/
+	
+	if (rvncounter == 0) {
+		RVN = (0.1005813032)*(hashrate)/(net_diff);
+		ravencolorcounter = rand() % 3;
+		if (ravencolorcounter == 0) {
+			applog(LOG_NOTICE,  CL_MA2  "RVN/day: %.3f RVN", RVN); //blue-purple	
+		}
+		if (ravencolorcounter == 1) {
+			applog(LOG_NOTICE,  CL_RD2  "RVN/day: %.3f RVN", RVN); //red	
+		}
+		if (ravencolorcounter == 2) {
+			applog(LOG_NOTICE,  CL_GR2  "RVN/day: %.3f RVN", RVN); //orange
+		}
+		if (ravencolorcounter != 0 && ravencolorcounter != 1 && ravencolorcounter != 2) {
+			applog(LOG_NOTICE,  CL_MA2  "RVN/day: %.3f RVN", RVN); //blue-purple
+		}
+	}
+	
+	rvncounter = rvncounter + 1;
+	
+	if (rvncounter == 5) {
+		rvncounter = 0;
+	}
+
+
 	if (reason) {
 		applog(LOG_WARNING, "reject reason: %s", reason);
 		if (!check_dups && strncasecmp(reason, "duplicate", 9) == 0) {
@@ -902,9 +980,10 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	}
 
 	/* discard if a newer block was received */
+	pthread_mutex_lock(&g_work_lock);
 	stale_work = work->height && work->height < g_work.height;
 	if (have_stratum && !stale_work && !opt_submit_stale && opt_algo != ALGO_ZR5 && opt_algo != ALGO_SCRYPT_JANE) {
-		pthread_mutex_lock(&g_work_lock);
+//		pthread_mutex_lock(&g_work_lock);
 		if (strlen(work->job_id + 8))
 			stale_work = strncmp(work->job_id + 8, g_work.job_id + 8, sizeof(g_work.job_id) - 8);
 		if (stale_work) {
@@ -916,8 +995,10 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 				check_stratum_jobs = true;
 			}
 		}
-		pthread_mutex_unlock(&g_work_lock);
+//		restart_threads();
+//		pthread_mutex_unlock(&g_work_lock);
 	}
+	pthread_mutex_unlock(&g_work_lock);
 
 	if (!have_stratum && !stale_work && allow_gbt) {
 		struct work wheight = { 0 };
@@ -929,7 +1010,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			}
 		}
 	}
-
+#if 0
+	
 	if (!stale_work && opt_algo == ALGO_ZR5 && !have_stratum) {
 		stale_work = (memcmp(&work->data[1], &g_work.data[1], 68));
 	}
@@ -939,13 +1021,13 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			applog(LOG_WARNING, "stale work detected, discarding");
 		return true;
 	}
-
+#endif
 	if (pool->type & POOL_STRATUM) {
 		uint32_t sent = 0;
 		uint32_t ntime, nonce = work->nonces[idnonce];
 		char *ntimestr, *noncestr, *xnonce2str, *nvotestr;
 		uint16_t nvote = 0;
-
+#if 0
 		switch (opt_algo) {
 		case ALGO_BLAKE:
 		case ALGO_BLAKECOIN:
@@ -984,11 +1066,12 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			be32enc(&nonce, work->data[19]);
 			break;
 		default:
+#endif
 			le32enc(&ntime, work->data[17]);
 			le32enc(&nonce, work->data[19]);
-		}
+//		}
 		noncestr = bin2hex((const uchar*)(&nonce), 4);
-
+#if 1
 		if (check_dups)
 			sent = hashlog_already_submittted(work->job_id, nonce);
 		if (sent > 0) {
@@ -1003,17 +1086,18 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 			restart_threads();
 			return true;
 		}
-
+#endif
 		ntimestr = bin2hex((const uchar*)(&ntime), 4);
-
+#if 0
 		if (opt_algo == ALGO_DECRED) {
 			xnonce2str = bin2hex((const uchar*)&work->data[36], stratum.xnonce1_size);
 		} else if (opt_algo == ALGO_SIA) {
 			uint16_t high_nonce = swab32(work->data[9]) >> 16;
 			xnonce2str = bin2hex((unsigned char*)(&high_nonce), 2);
 		} else {
+#endif
 			xnonce2str = bin2hex(work->xnonce2, work->xnonce2_len);
-		}
+//		}
 
 		// store to keep/display the solved ratio/diff
 		stratum.sharediff = work->sharediff[idnonce];
@@ -1049,15 +1133,73 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		if (check_dups || opt_showdiff)
 			hashlog_remember_submit(work, nonce);
 		stratum.job.shares_count++;
+/*	}
+	else if (work->txs2) {
 
+		char data_str[2 * sizeof(work->data) + 1];
+		char *req;
+
+		for (int i = 0; i < ARRAY_SIZE(work->data); i++)
+			be32enc(work->data + i, work->data[i]);
+		cbin2hex(data_str, (char *)work->data, 80);
+		if (work->workid) {
+			char *params;
+			val = json_object();
+			json_object_set_new(val, "workid", json_string(work->workid));
+			params = json_dumps(val, 0);
+			json_decref(val);
+			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2) + strlen(params));
+			sprintf(req,
+				"{\"method\": \"submitblock\", \"params\": [\"%s%s\", %s], \"id\":4}\r\n",
+				data_str, work->txs2, params);
+			free(params);
+		}
+		else {
+			req = (char*)malloc(128 + 2 * 80 + strlen(work->txs2));
+			sprintf(req,
+				"{\"method\": \"submitblock\", \"params\": [\"%s%s\"], \"id\":4}\r\n",
+				data_str, work->txs2);
+		}
+*/
+/*
+		val = json_rpc_call_pool(curl, pool, req, false, false, NULL);
+		free(req);
+		if (unlikely(!val)) {
+			applog(LOG_ERR, "submit_upstream_work json_rpc_call failed");
+			return false;
+		}
+
+		res = json_object_get(val, "result");
+		if (json_is_object(res)) {
+			char *res_str;
+			bool sumres = false;
+			void *iter = json_object_iter(res);
+			while (iter) {
+				if (json_is_null(json_object_iter_value(iter))) {
+					sumres = true;
+					break;
+				}
+				iter = json_object_iter_next(res, iter);
+			}
+			res_str = json_dumps(res, 0);
+			share_result(sumres, work->pooln, work->sharediff[idnonce], res_str);
+			free(res_str);
+		}
+		else
+			share_result(json_is_null(res), work->pooln, work->sharediff[idnonce], json_string_value(res));
+
+		json_decref(val);
+
+	}
+	else {
+*/
 	} else {
-
 		int data_size = 128;
 		int adata_sz = data_size / sizeof(uint32_t);
 
 		/* build hex string */
 		char *str = NULL;
-
+		/*
 		if (opt_algo == ALGO_ZR5) {
 			data_size = 80; adata_sz = 20;
 		}
@@ -1067,7 +1209,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		else if (opt_algo == ALGO_SIA) {
 			return sia_submit(curl, pool, work);
 		}
-
+		*/
 		if (opt_algo != ALGO_HEAVY && opt_algo != ALGO_MJOLLNIR) {
 			for (int i = 0; i < adata_sz; i++)
 				le32enc(work->data + i, work->data[i]);
@@ -1106,6 +1248,8 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 	return true;
 }
+
+#define BLOCK_VERSION_CURRENT 255
 
 /* simplified method to only get some extra infos in solo mode */
 static bool gbt_work_decode(const json_t *val, struct work *work)
@@ -1146,11 +1290,318 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	return true;
 }
 
+//CHECK HERE FOR ERRRORS
+int varint_encode(unsigned char *p, uint64_t n)
+{
+	int i;
+	if (n < 0xfd) {
+		p[0] = (uchar)n;
+		return 1;
+	}
+	if (n <= 0xffff) {
+		p[0] = 0xfd;
+		p[1] = n & 0xff;
+		p[2] = (uchar)(n >> 8);
+		return 3;
+	}
+	if (n <= 0xffffffff) {
+		p[0] = 0xfe;
+		for (i = 1; i < 5; i++) {
+			p[i] = n & 0xff;
+			n >>= 8;
+		}
+		return 5;
+	}
+	p[0] = 0xff;
+	for (i = 1; i < 9; i++) {
+		p[i] = n & 0xff;
+		n >>= 8;
+	}
+	return 9;
+}
+
+static bool gbt_work_decode_full(const json_t *val, struct work *work)
+{
+	int i, n;
+	uint32_t version, curtime, bits;
+	uint32_t prevhash[8];
+	uint32_t target[8];
+	int cbtx_size;
+	uchar *cbtx = NULL;
+	int tx_count, tx_size;
+	uchar txc_vi[9];
+	uchar(*merkle_tree)[32] = NULL;
+	bool coinbase_append = false;
+	bool submit_coinbase = false;
+	bool version_force = false;
+	bool version_reduce = false;
+	json_t *tmp, *txa;
+	bool rc = false;
+
+	tmp = json_object_get(val, "mutable");
+	if (tmp && json_is_array(tmp)) {
+		n = (int)json_array_size(tmp);
+		for (i = 0; i < n; i++) {
+			const char *s = json_string_value(json_array_get(tmp, i));
+			if (!s)
+				continue;
+			if (!strcmp(s, "coinbase/append"))
+				coinbase_append = true;
+			else if (!strcmp(s, "submit/coinbase"))
+				submit_coinbase = true;
+			else if (!strcmp(s, "version/force"))
+				version_force = true;
+			else if (!strcmp(s, "version/reduce"))
+				version_reduce = true;
+		}
+	}
+
+	tmp = json_object_get(val, "height");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid height");
+		goto out;
+	}
+	work->height = (int)json_integer_value(tmp);
+	applog(LOG_BLUE, "Current block is %d", work->height);
+
+	tmp = json_object_get(val, "version");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid version");
+		goto out;
+	}
+	version = (uint32_t)json_integer_value(tmp);
+	if ((version & 0xffU) > BLOCK_VERSION_CURRENT) {
+		if (version_reduce) {
+			version = (version & ~0xffU) | BLOCK_VERSION_CURRENT;
+		}
+		else if (allow_gbt && allow_getwork && !version_force) {
+			applog(LOG_DEBUG, "Switching to getwork, gbt version %d", version);
+			allow_gbt = false;
+			goto out;
+		}
+		else if (!version_force) {
+			applog(LOG_ERR, "Unrecognized block version: %u", version);
+			goto out;
+		}
+	}
+
+	if (unlikely(!jobj_binary(val, "previousblockhash", prevhash, sizeof(prevhash)))) {
+		applog(LOG_ERR, "JSON invalid previousblockhash");
+		goto out;
+	}
+
+	tmp = json_object_get(val, "curtime");
+	if (!tmp || !json_is_integer(tmp)) {
+		applog(LOG_ERR, "JSON invalid curtime");
+		goto out;
+	}
+	curtime = (uint32_t)json_integer_value(tmp);
+
+	if (unlikely(!jobj_binary(val, "bits", &bits, sizeof(bits)))) {
+		applog(LOG_ERR, "JSON invalid bits");
+		goto out;
+	}
+
+	/* find count and size of transactions */
+	txa = json_object_get(val, "transactions");
+	if (!txa || !json_is_array(txa)) {
+		applog(LOG_ERR, "JSON invalid transactions");
+		goto out;
+	}
+	tx_count = (int)json_array_size(txa);
+	tx_size = 0;
+	for (i = 0; i < tx_count; i++) {
+		const json_t *tx = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tx, "data"));
+		if (!tx_hex) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			goto out;
+		}
+		tx_size += (int)(strlen(tx_hex) / 2);
+	}
+
+	/* build coinbase transaction */
+	tmp = json_object_get(val, "coinbasetxn");
+	if (tmp) {
+		const char *cbtx_hex = json_string_value(json_object_get(tmp, "data"));
+		cbtx_size = cbtx_hex ? (int)strlen(cbtx_hex) / 2 : 0;
+		cbtx = (uchar*)malloc(cbtx_size + 100);
+		if (cbtx_size < 60 || !hex2bin(cbtx, cbtx_hex, cbtx_size)) {
+			applog(LOG_ERR, "JSON invalid coinbasetxn");
+			goto out;
+		}
+	}
+	else {
+		int64_t cbvalue;
+		if (!pk_script_size) {
+			if (allow_getwork) {
+				applog(LOG_INFO, "No payout address provided, switching to getwork");
+				allow_gbt = false;
+			}
+			else
+				applog(LOG_ERR, "No payout address provided");
+			goto out;
+		}
+		tmp = json_object_get(val, "coinbasevalue");
+		if (!tmp || !json_is_number(tmp)) {
+			applog(LOG_ERR, "JSON invalid coinbasevalue");
+			goto out;
+		}
+		cbvalue = (int64_t)(json_is_integer(tmp) ? json_integer_value(tmp) : json_number_value(tmp));
+		cbtx = (uchar*)malloc(256);
+		le32enc((uint32_t *)cbtx, 1); /* version */
+		cbtx[4] = 1; /* in-counter */
+		memset(cbtx + 5, 0x00, 32); /* prev txout hash */
+		le32enc((uint32_t *)(cbtx + 37), 0xffffffff); /* prev txout index */
+		cbtx_size = 43;
+		/* BIP 34: height in coinbase */
+		for (n = work->height; n; n >>= 8)
+			cbtx[cbtx_size++] = n & 0xff;
+		cbtx[42] = cbtx_size - 43;
+		cbtx[41] = cbtx_size - 42; /* scriptsig length */
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0xffffffff); /* sequence */
+		cbtx_size += 4;
+		cbtx[cbtx_size++] = 1; /* out-counter */
+		le32enc((uint32_t *)(cbtx + cbtx_size), (uint32_t)cbvalue); /* value */
+		le32enc((uint32_t *)(cbtx + cbtx_size + 4), cbvalue >> 32);
+		cbtx_size += 8;
+		cbtx[cbtx_size++] = (uint8_t)pk_script_size; /* txout-script length */
+		memcpy(cbtx + cbtx_size, pk_script, pk_script_size);
+		cbtx_size += (int)pk_script_size;
+		le32enc((uint32_t *)(cbtx + cbtx_size), 0); /* lock time */
+		cbtx_size += 4;
+		coinbase_append = true;
+	}
+	if (coinbase_append) {
+		unsigned char xsig[100];
+		int xsig_len = 0;
+		tmp = json_object_get(val, "coinbaseaux");
+		if (tmp && json_is_object(tmp)) {
+			void *iter = json_object_iter(tmp);
+			while (iter) {
+				unsigned char buf[100];
+				const char *s = json_string_value(json_object_iter_value(iter));
+				n = s ? (int)(strlen(s) / 2) : 0;
+				if (!s || n > 100 || !hex2bin(buf, s, n)) {
+					applog(LOG_ERR, "JSON invalid coinbaseaux");
+					break;
+				}
+				if (cbtx[41] + xsig_len + n <= 100) {
+					memcpy(xsig + xsig_len, buf, n);
+					xsig_len += n;
+				}
+				iter = json_object_iter_next(tmp, iter);
+			}
+		}
+		if (xsig_len) {
+			unsigned char *ssig_end = cbtx + 42 + cbtx[41];
+			int push_len = cbtx[41] + xsig_len < 76 ? 1 :
+				cbtx[41] + 2 + xsig_len > 100 ? 0 : 2;
+			n = xsig_len + push_len;
+			memmove(ssig_end + n, ssig_end, cbtx_size - 42 - cbtx[41]);
+			cbtx[41] += n;
+			if (push_len == 2)
+				*(ssig_end++) = 0x4c; /* OP_PUSHDATA1 */
+			if (push_len)
+				*(ssig_end++) = xsig_len;
+			memcpy(ssig_end, xsig, xsig_len);
+			cbtx_size += n;
+		}
+	}
+
+	n = varint_encode(txc_vi, 1 + tx_count);
+
+	work->txs2 = (char*)malloc(2 * (n + cbtx_size + tx_size) + 1);
+	cbin2hex(work->txs2, (char *)txc_vi, n);
+	cbin2hex(work->txs2 + 2 * n, (char *)cbtx, cbtx_size);
+
+	/* generate merkle root */
+	merkle_tree = (uchar(*)[32]) calloc(((1 + tx_count + 1) & ~1), 32);
+	sha256d(merkle_tree[0], cbtx, cbtx_size);
+
+	for (i = 0; i < tx_count; i++) {
+		tmp = json_array_get(txa, i);
+		const char *tx_hex = json_string_value(json_object_get(tmp, "data"));
+		const int tx_size = tx_hex ? (int)(strlen(tx_hex) / 2) : 0;
+		unsigned char *tx = (uchar*)malloc(tx_size);
+		if (!tx_hex || !hex2bin(tx, tx_hex, tx_size)) {
+			applog(LOG_ERR, "JSON invalid transactions");
+			free(tx);
+			goto out;
+		}
+		sha256d(merkle_tree[1 + i], tx, tx_size);
+		if (!submit_coinbase)
+			strcat(work->txs2, tx_hex);
+	}
+	n = 1 + tx_count;
+	while (n > 1) {
+		if (n % 2) {
+			memcpy(merkle_tree[n], merkle_tree[n - 1], 32);
+			++n;
+		}
+		n /= 2;
+		for (i = 0; i < n; i++)
+			sha256d(merkle_tree[i], merkle_tree[2 * i], 64);
+	}
+
+	/* assemble block header */
+	work->data[0] = swab32(version);
+	for (i = 0; i < 8; i++)
+		work->data[8 - i] = le32dec(prevhash + i);
+	for (i = 0; i < 8; i++)
+		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
+	work->data[17] = swab32(curtime);
+	work->data[18] = le32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
+
+	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
+		applog(LOG_ERR, "JSON invalid target");
+		goto out;
+	}
+	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+		work->target[7 - i] = be32dec(target + i);
+	tmp = json_object_get(val, "workid");
+	if (tmp) {
+		if (!json_is_string(tmp)) {
+			applog(LOG_ERR, "JSON invalid workid");
+			goto out;
+		}
+		work->workid = strdup(json_string_value(tmp));
+	}
+
+	rc = true;
+out:
+	/* Long polling */
+	tmp = json_object_get(val, "longpollid");
+	if (want_longpoll && json_is_string(tmp)) {
+		free(lp_id);
+		lp_id = strdup(json_string_value(tmp));
+		if (!have_longpoll) {
+			char *lp_uri;
+			tmp = json_object_get(val, "longpolluri");
+			lp_uri = json_is_string(tmp) ? strdup(json_string_value(tmp)) : rpc_url;
+			have_longpoll = true;
+			tq_push(thr_info[longpoll_thr_id].q, lp_uri);
+		}
+	}
+
+	free(merkle_tree);
+	free(cbtx);
+	return rc;
+}
+
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
 static const char *gbt_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{"
 	//	"\"capabilities\": " GBT_CAPABILITIES ""
 	"}], \"id\":9}\r\n";
+
+static const char *gbt_req_segwit =
+"{\"method\": \"getblocktemplate\", \"params\": [{\"rules\":[\"segwit\"]"
+//	"\"capabilities\": " GBT_CAPABILITIES ""
+"}], \"id\":9}\r\n";
 
 static bool get_blocktemplate(CURL *curl, struct work *work)
 {
@@ -1159,7 +1610,7 @@ static bool get_blocktemplate(CURL *curl, struct work *work)
 		return false;
 
 	int curl_err = 0;
-	json_t *val = json_rpc_call_pool(curl, pool, gbt_req, false, false, &curl_err);
+	json_t *val = json_rpc_call_pool(curl, pool, opt_segwit_mode ? gbt_req_segwit : gbt_req, false, false, &curl_err);
 
 	if (!val && curl_err == -1) {
 		// when getblocktemplate is not supported, disable it
@@ -1232,6 +1683,19 @@ static bool get_mininginfo(CURL *curl, struct work *work)
 static const char *json_rpc_getwork =
 	"{\"method\":\"getwork\",\"params\":[],\"id\":0}\r\n";
 
+static const char *json_rpc_gbt =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES "}], \"id\":0}\r\n";
+static const char *json_rpc_gbt_segwit =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES ", \"rules\":[\"segwit\"]}], \"id\":0}\r\n";
+static const char *json_rpc_gbt_lp =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+static const char *json_rpc_gbt_lp_segwit =
+	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+	GBT_CAPABILITIES ", \"longpollid\": \"%s\", \"rules\":[\"segwit\"]}], \"id\":0}\r\n";
+
 static bool get_upstream_work(CURL *curl, struct work *work)
 {
 	bool rc = false;
@@ -1241,7 +1705,7 @@ static bool get_upstream_work(CURL *curl, struct work *work)
 	json_t *val;
 
 	gettimeofday(&tv_start, NULL);
-
+#if 0
 	if (opt_algo == ALGO_SIA) {
 		char *sia_header = sia_getheader(curl, pool);
 		if (sia_header) {
@@ -1254,13 +1718,16 @@ static bool get_upstream_work(CURL *curl, struct work *work)
 		}
 		return rc;
 	}
-
+#endif
 	if (opt_debug_threads)
 		applog(LOG_DEBUG, "%s: want_longpoll=%d have_longpoll=%d",
 			__func__, want_longpoll, have_longpoll);
 
+	int err;
+start:
+
 	/* want_longpoll/have_longpoll required here to init/unlock the lp thread */
-	val = json_rpc_call_pool(curl, pool, rpc_req, want_longpoll, have_longpoll, NULL);
+	val = json_rpc_call_pool(curl, pool, allow_gbt ? (opt_segwit_mode ? json_rpc_gbt_segwit : json_rpc_gbt) : json_rpc_getwork, want_longpoll, have_longpoll, &err);
 	gettimeofday(&tv_end, NULL);
 
 	if (have_stratum || unlikely(work->pooln != cur_pooln)) {
@@ -1269,10 +1736,32 @@ static bool get_upstream_work(CURL *curl, struct work *work)
 		return false;
 	}
 
+	if (!allow_gbt && !allow_getwork) {
+		applog(LOG_ERR, "No usable protocol");
+		if (val)
+			json_decref(val);
+		return false;
+	}
+
+	if (allow_gbt && allow_getwork && !val && err == CURLE_OK) {
+		applog(LOG_NOTICE, "getblocktemplate failed, falling back to getwork");
+		allow_gbt = false;
+		goto start;
+	}
+
 	if (!val)
 		return false;
 
-	rc = work_decode(json_object_get(val, "result"), work);
+	if (allow_gbt) {
+		rc = gbt_work_decode_full(json_object_get(val, "result"), work);
+		if (!allow_gbt) {
+			json_decref(val);
+			goto start;
+		}
+	}
+	else {
+		rc = work_decode(json_object_get(val, "result"), work);
+	}
 
 	if (opt_protocol && rc) {
 		timeval_subtract(&diff, &tv_end, &tv_start);
@@ -1457,14 +1946,16 @@ bool get_work(struct thr_info *thr, struct work *work)
 		memset(work->data, 0x55, 76);
 		//work->data[17] = swab32((uint32_t)time(NULL));
 		memset(work->data + 19, 0x00, 52);
+#if 0
 		if (opt_algo == ALGO_DECRED) {
 			memset(&work->data[35], 0x00, 52);
 		} else if (opt_algo == ALGO_LBRY) {
 			work->data[28] = 0x80000000;
 		} else {
+#endif
 			work->data[20] = 0x80000000;
 			work->data[31] = 0x00000280;
-		}
+//		}
 		memset(work->target, 0x00, sizeof(work->target));
 		return true;
 	}
@@ -1551,6 +2042,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	work->pooln = sctx->pooln;
 
 	/* Generate merkle root */
+#if 0
 	switch (opt_algo) {
 		case ALGO_DECRED:
 		case ALGO_EQUIHASH:
@@ -1572,8 +2064,9 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			break;
 		case ALGO_WHIRLPOOL:
 		default:
+#endif
 			sha256d(merkle_root, sctx->job.coinbase, (int)sctx->job.coinbase_size);
-	}
+//	}
 
 	for (i = 0; i < sctx->job.merkle_count; i++) {
 		memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
@@ -1584,7 +2077,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 #endif
 			sha256d(merkle_root, merkle_root, 64);
 	}
-	
+
 	/* Increment extranonce2 */
 	for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
 
@@ -1593,7 +2086,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	work->data[0] = le32dec(sctx->job.version);
 	for (i = 0; i < 8; i++)
 		work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
-
+#if 0
 	if (opt_algo == ALGO_DECRED) {
 		uint16_t vote;
 		for (i = 0; i < 8; i++) // reversed prevhash
@@ -1643,7 +2136,9 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		memcpy(&work->data[12], sctx->job.coinbase, 32); // merkle_root
 		work->data[20] = 0x80000000;
 		if (opt_debug) applog_hex(work->data, 80);
-	} else {
+	} else 
+#endif
+	{
 		for (i = 0; i < 8; i++)
 			work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
 		work->data[17] = le32dec(sctx->job.ntime);
@@ -1654,7 +2149,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 
 	if (opt_showdiff || opt_max_diff > 0.)
 		calc_network_diff(work);
-
+#if 0
 	switch (opt_algo) {
 	case ALGO_MJOLLNIR:
 	case ALGO_HEAVY:
@@ -1672,7 +2167,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		ext[1] = be16dec(sctx->job.nreward);
 		// applog(LOG_DEBUG, "DEBUG: vote=%hx reward=%hx", ext[0], ext[1]);
 	}
-
+#endif
 	pthread_mutex_unlock(&stratum_work_lock);
 
 	if (opt_debug && opt_algo != ALGO_DECRED && opt_algo != ALGO_EQUIHASH && opt_algo != ALGO_SIA) {
@@ -1690,6 +2185,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		opt_difficulty = 1.;
 
 	switch (opt_algo) {
+#if 0
 		case ALGO_HMQ1725:
 		case ALGO_JACKPOT:
 		case ALGO_JHA:
@@ -1706,12 +2202,13 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		case ALGO_LBRY:
 		case ALGO_LYRA2v2:
 		case ALGO_LYRA2Z:
-		case ALGO_TIMETRAVEL:
-		case ALGO_BITCORE:
+#endif
+//		case ALGO_TIMETRAVEL:
+//		case ALGO_BITCORE:
 		case ALGO_X16R:
-		case ALGO_X16S:
-			work_set_target(work, sctx->job.diff / (256.0 * opt_difficulty));
+			work_set_target(work, sctx->job.diff / (256.0 * opt_difficulty));//(256.0 * opt_difficulty));
 			break;
+#if 0
 		case ALGO_KECCAK:
 		case ALGO_LYRA2:
 			work_set_target(work, sctx->job.diff / (128.0 * opt_difficulty));
@@ -1721,6 +2218,7 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 			break;
 		default:
 			work_set_target(work, sctx->job.diff / opt_difficulty);
+#endif
 	}
 
 	if (stratum_diff != sctx->job.diff) {
@@ -1729,11 +2227,13 @@ static bool stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		stratum_diff = sctx->job.diff;
 		if (opt_showdiff && work->targetdiff != stratum_diff)
 			snprintf(sdiff, 32, " (%.5f)", work->targetdiff);
-		applog(LOG_WARNING, "Stratum difficulty set to %g%s", stratum_diff, sdiff);
+		applog(LOG_WARNING, "Stratum difficulty set to %g", stratum_diff);
 	}
-
+	sctx->job.clean = 1; //!!!
 	return true;
 }
+
+__host__ extern void x11_echo512_cpu_init(int thr_id, uint32_t threads);
 
 void restart_threads(void)
 {
@@ -1741,7 +2241,13 @@ void restart_threads(void)
 		applog(LOG_DEBUG,"%s", __FUNCTION__);
 
 	for (int i = 0; i < opt_n_threads && work_restart; i++)
-		work_restart[i].restart = 1;
+	{
+		if (!work_restart[i].restart)
+		{
+			work_restart[i].restart = 1;
+			x11_echo512_cpu_init(i, 1 << 21);
+		}
+	}
 }
 
 static bool wanna_mine(int thr_id)
@@ -1766,7 +2272,7 @@ static bool wanna_mine(int thr_id)
 	}
 	// Network Difficulty
 	if (opt_max_diff > 0.0 && net_diff > opt_max_diff) {
-		int next = pool_get_first_valid(cur_pooln+1);
+		int next = pool_get_first_valid(cur_pooln+1, false);
 		if (num_pools > 1 && pools[next].max_diff != pools[cur_pooln].max_diff && opt_resume_diff <= 0.)
 			conditional_pool_rotate = allow_pool_rotate;
 		if (!thr_id && !conditional_state[thr_id] && !opt_quiet)
@@ -1779,7 +2285,7 @@ static bool wanna_mine(int thr_id)
 	}
 	// Network hashrate
 	if (opt_max_rate > 0.0 && net_hashrate > opt_max_rate) {
-		int next = pool_get_first_valid(cur_pooln+1);
+		int next = pool_get_first_valid(cur_pooln+1, false);
 		if (pools[next].max_rate != pools[cur_pooln].max_rate && opt_resume_rate <= 0.)
 			conditional_pool_rotate = allow_pool_rotate;
 		if (!thr_id && !conditional_state[thr_id] && !opt_quiet) {
@@ -1795,6 +2301,16 @@ static bool wanna_mine(int thr_id)
 	}
 	conditional_state[thr_id] = (uint8_t) !state; // only one wait message in logs
 	return state;
+}
+
+static bool is_dev_time() {
+	// Add 2 seconds to compensate for connection time
+	time_t dev_portion = double(DONATE_CYCLE_TIME)
+											* dev_donate_percent * 0.01 + 2;
+	if(dev_portion < 12) // No point in bothering with less than 10s
+		return false;
+	return (time(NULL) - dev_timestamp + dev_timestamp_offset) % DONATE_CYCLE_TIME
+					>= (DONATE_CYCLE_TIME - dev_portion);
 }
 
 static void *miner_thread(void *userdata)
@@ -1902,9 +2418,10 @@ static void *miner_thread(void *userdata)
 			uint32_t sleeptime = 0;
 
 			if (opt_algo == ALGO_DECRED || opt_algo == ALGO_WILDKECCAK /* getjob */)
-				work_done = true; // force "regen" hash
+				work_done = true; // force "regen" hash		
 			while (!work_done && time(NULL) >= (g_work_time + opt_scantime)) {
-				usleep(100*1000);
+//				usleep(100*1000);
+				usleep(100);
 				if (sleeptime > 4) {
 					extrajob = true;
 					break;
@@ -1918,9 +2435,11 @@ static void *miner_thread(void *userdata)
 			extrajob |= work_done;
 
 			regen = (nonceptr[0] >= end_nonce);
+#if 0
 			if (opt_algo == ALGO_SIA) {
 				regen = ((nonceptr[1] & 0xFF00) >= 0xF000);
 			}
+#endif
 			regen = regen || extrajob;
 
 			if (regen) {
@@ -1998,6 +2517,7 @@ static void *miner_thread(void *userdata)
 		}
 
 		else if (memcmp(&work.data[wcmpoft], &g_work.data[wcmpoft], wcmplen)) {
+
 			#if 0
 			if (opt_debug) {
 				for (int n=0; n <= (wcmplen-8); n+=8) {
@@ -2054,12 +2574,12 @@ static void *miner_thread(void *userdata)
 		pthread_mutex_unlock(&g_work_lock);
 
 		// --benchmark [-a all]
-		if (opt_benchmark && bench_algo >= 0) {
+		if (opt_benchmark && -1 >= 0) {
 			//gpulog(LOG_DEBUG, thr_id, "loop %d", loopcnt);
 			if (loopcnt >= 3) {
-				if (!bench_algo_switch_next(thr_id) && thr_id == 0)
+				if (1 == 2 && thr_id == 0)
 				{
-					bench_display_results();
+					//bench_display_results();
 					proper_exit(0);
 					break;
 				}
@@ -2094,7 +2614,7 @@ static void *miner_thread(void *userdata)
 			if (need_nvsettings) nvs_reset_clocks(dev_id);
 #endif
 			// free gpu resources
-			algo_free_all(thr_id);
+//			algo_free_all(thr_id);
 			// clear any free error (algo switch)
 			cuda_clear_lasterror();
 
@@ -2116,6 +2636,37 @@ static void *miner_thread(void *userdata)
 			global_hashrate = 0;
 			sleep(5);
 			if (!thr_id) pools[cur_pooln].wait_time += 5;
+			continue;
+		} else if (is_dev_time() == ((pools[cur_pooln].type & POOL_DONATE) == 0) &&
+				!have_longpoll) {
+
+			// reset default mem offset before idle..
+#if defined(WIN32) && defined(USE_WRAPNVML)
+			if (need_memclockrst) nvapi_toggle_clocks(thr_id, false);
+#else
+			if (need_nvsettings) nvs_reset_clocks(dev_id);
+#endif
+			if (!pool_is_switching) {
+				// Switch back to previous pool
+				if (pools[cur_pooln].type & POOL_DONATE) {
+					pool_switch(thr_id, prev_pooln);
+					if (!thr_id) prev_pooln = cur_pooln;
+				}
+				// Switch to dev pool
+				else {
+					if (!thr_id) prev_pooln = cur_pooln;
+					int dev_pool = pool_get_first_valid(cur_pooln, true);
+					pool_switch(thr_id, dev_pool);
+				}
+				pool_is_switching = true;
+			}
+			else if (time(NULL) - firstwork_time > 35) {
+				if (!opt_quiet)
+					applog(LOG_WARNING, "Pool switching timed out...");
+				if (!thr_id) pools[cur_pooln].wait_time += 1;
+				pool_is_switching = false;
+			}
+			sleep(1);
 			continue;
 		} else {
 			// reapply mem offset if needed
@@ -2210,6 +2761,7 @@ static void *miner_thread(void *userdata)
 		/* on start, max64 should not be 0,
 		 *    before hashrate is computed */
 		if (max64 < minmax) {
+#if 0
 			switch (opt_algo) {
 			case ALGO_BLAKECOIN:
 			case ALGO_BLAKE2S:
@@ -2221,7 +2773,7 @@ static void *miner_thread(void *userdata)
 			case ALGO_DECRED:
 			case ALGO_SHA256D:
 			case ALGO_SHA256T:
-			//case ALGO_WHIRLPOOLX:
+			case ALGO_WHIRLPOOLX:
 				minmax = 0x40000000U;
 				break;
 			case ALGO_KECCAK:
@@ -2233,7 +2785,7 @@ static void *miner_thread(void *userdata)
 			case ALGO_SKEIN2:
 			case ALGO_TRIBUS:
 				minmax = 0x1000000;
-				break;
+				break;  
 			case ALGO_C11:
 			case ALGO_DEEP:
 			case ALGO_HEAVY:
@@ -2249,7 +2801,6 @@ static void *miner_thread(void *userdata)
 			case ALGO_BITCORE:
 			case ALGO_X11EVO:
 			case ALGO_X11:
-			case ALGO_X12:
 			case ALGO_X13:
 			case ALGO_WHIRLCOIN:
 			case ALGO_WHIRLPOOL:
@@ -2258,7 +2809,7 @@ static void *miner_thread(void *userdata)
 			case ALGO_X14:
 			case ALGO_X15:
 				minmax = 0x300000;
-				break;
+				break;	
 			case ALGO_LYRA2:
 			case ALGO_LYRA2Z:
 			case ALGO_NEOSCRYPT:
@@ -2271,8 +2822,9 @@ static void *miner_thread(void *userdata)
 			case ALGO_CRYPTONIGHT:
 			case ALGO_SCRYPT_JANE:
 				minmax = 0x1000;
-				break;
+				break;	
 			}
+#endif
 			max64 = max(minmax-1, max64);
 		}
 
@@ -2322,7 +2874,7 @@ static void *miner_thread(void *userdata)
 
 		/* scan nonces for a proof-of-work hash */
 		switch (opt_algo) {
-
+#if 0
 		case ALGO_BASTION:
 			rc = scanhash_bastion(thr_id, &work, max_nonce, &hashes_done);
 			break;
@@ -2496,9 +3048,6 @@ static void *miner_thread(void *userdata)
 		case ALGO_X11:
 			rc = scanhash_x11(thr_id, &work, max_nonce, &hashes_done);
 			break;
-		case ALGO_X12:
-			rc = scanhash_x12(thr_id, &work, max_nonce, &hashes_done);
-			break;
 		case ALGO_X13:
 			rc = scanhash_x13(thr_id, &work, max_nonce, &hashes_done);
 			break;
@@ -2508,18 +3057,18 @@ static void *miner_thread(void *userdata)
 		case ALGO_X15:
 			rc = scanhash_x15(thr_id, &work, max_nonce, &hashes_done);
 			break;
+#endif
 		case ALGO_X16R:
 			rc = scanhash_x16r(thr_id, &work, max_nonce, &hashes_done);
 			break;
-		case ALGO_X16S:
-			rc = scanhash_x16s(thr_id, &work, max_nonce, &hashes_done);
-			break;
+#if 0
 		case ALGO_X17:
 			rc = scanhash_x17(thr_id, &work, max_nonce, &hashes_done);
 			break;
 		case ALGO_ZR5:
 			rc = scanhash_zr5(thr_id, &work, max_nonce, &hashes_done);
 			break;
+#endif
 
 		default:
 			/* should never happen */
@@ -2583,7 +3132,7 @@ static void *miner_thread(void *userdata)
 			if (dtime > 0.0) {
 				pthread_mutex_lock(&stats_lock);
 				thr_hashrates[thr_id] = hashes_done / dtime;
-				thr_hashrates[thr_id] *= rate_factor;
+				//thr_hashrates[thr_id] *= rate_factor;
 				if (loopcnt > 2) // ignore first (init time)
 					stats_remember_speed(thr_id, hashes_done, thr_hashrates[thr_id], (uint8_t) rc, work.height);
 				pthread_mutex_unlock(&stats_lock);
@@ -2594,6 +3143,12 @@ static void *miner_thread(void *userdata)
 			work.scanned_to = work.nonces[0];
 		if (rc > 1)
 			work.scanned_to = max(work.nonces[0], work.nonces[1]);
+		if (rc == -128)
+		{
+			work.data[19] = max_nonce;
+			usleep(100);
+
+		}
 		else {
 			work.scanned_to = max_nonce;
 			if (opt_debug && opt_benchmark) {
@@ -2623,7 +3178,7 @@ static void *miner_thread(void *userdata)
 			for (int i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
 				hashrate += stats_get_speed(i, thr_hashrates[i]);
 			pthread_mutex_unlock(&stats_lock);
-			if (opt_benchmark && bench_algo == -1 && loopcnt > 2) {
+			if (opt_benchmark && -2 == -1 && loopcnt > 2) {
 				format_hashrate(hashrate, s);
 				applog(LOG_NOTICE, "Total: %s", s);
 			}
@@ -2649,6 +3204,8 @@ static void *miner_thread(void *userdata)
 
 			work.submit_nonce_id = 0;
 			nonceptr[0] = work.nonces[0];
+			if (work_restart[thr_id].restart)
+				continue;
 			if (!submit_work(mythr, &work))
 				break;
 			nonceptr[0] = curnonce;
@@ -2667,10 +3224,14 @@ static void *miner_thread(void *userdata)
 			if (rc > 1 && work.nonces[1]) {
 				work.submit_nonce_id = 1;
 				nonceptr[0] = work.nonces[1];
+#if 0
 				if (opt_algo == ALGO_ZR5) {
 					work.data[0] = work.data[22]; // pok
 					work.data[22] = 0;
 				}
+#endif
+				if (work_restart[thr_id].restart)
+						continue;
 				if (!submit_work(mythr, &work))
 					break;
 				nonceptr[0] = curnonce;
@@ -2776,7 +3337,13 @@ longpoll_retry:
 			continue;
 		}
 
-		val = json_rpc_longpoll(curl, lp_url, pool, rpc_req, &err);
+		char *req = NULL;
+		if (allow_gbt) {
+			req = (char*)malloc(strlen(opt_segwit_mode ? json_rpc_gbt_lp_segwit : json_rpc_gbt_lp) + strlen(lp_id) + 1);
+			sprintf(req, opt_segwit_mode ? json_rpc_gbt_lp_segwit : json_rpc_gbt_lp, lp_id);
+		}
+		val = json_rpc_longpoll(curl, lp_url, pool, req ? req : json_rpc_getwork, &err);
+		if (allow_gbt) free(req);
 		if (have_stratum || switchn != pool_switch_count) {
 			if (val)
 				json_decref(val);
@@ -2996,13 +3563,23 @@ wait_stratum_url:
 					applog(LOG_BLUE, "%s asks job %d for block %d", pool->short_url,
 						strtoul(stratum.job.job_id, NULL, 16), stratum.job.height);
 			}
+#define realign_work() 
+			realign_work();
 			pthread_mutex_unlock(&g_work_lock);
 		}
-		
+
 		// check we are on the right pool
 		if (switchn != pool_switch_count) goto pool_switched;
 
-		if (!stratum_socket_full(&stratum, opt_timeout)) {
+		bool stratum_full = false;
+		for (int i = 0; i < opt_timeout; i++) {
+			if (stratum_socket_full(&stratum, 1)) {
+				stratum_full = true;
+				break;
+			}
+			if (switchn != pool_switch_count) goto pool_switched;
+		}
+		if (!stratum_full) {
 			if (opt_debug)
 				applog(LOG_WARNING, "Stratum connection timed out");
 			s = NULL;
@@ -3070,6 +3647,110 @@ static void show_usage_and_exit(int status)
 		printf(bbr_usage);
 	}
 	proper_exit(status);
+}
+
+static const char b58digits[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+static bool b58dec(unsigned char *bin, size_t binsz, const char *b58)
+{
+	size_t i, j;
+	uint64_t t;
+	uint32_t c;
+	uint32_t *outi;
+	size_t outisz = (binsz + 3) / 4;
+	int rem = binsz % 4;
+	uint32_t remmask = 0xffffffff << (8 * rem);
+	size_t b58sz = strlen(b58);
+	bool rc = false;
+
+	outi = (uint32_t *)calloc(outisz, sizeof(*outi));
+
+	for (i = 0; i < b58sz; ++i) {
+		for (c = 0; b58digits[c] != b58[i]; c++)
+			if (!b58digits[c])
+				goto out;
+		for (j = outisz; j--;) {
+			t = (uint64_t)outi[j] * 58 + c;
+			c = t >> 32;
+			outi[j] = t & 0xffffffff;
+		}
+		if (c || outi[0] & remmask)
+			goto out;
+	}
+
+	j = 0;
+	switch (rem) {
+	case 3:
+		*(bin++) = (outi[0] >> 16) & 0xff;
+	case 2:
+		*(bin++) = (outi[0] >> 8) & 0xff;
+	case 1:
+		*(bin++) = outi[0] & 0xff;
+		++j;
+	default:
+		break;
+	}
+	for (; j < outisz; ++j) {
+		be32enc((uint32_t *)bin, outi[j]);
+		bin += sizeof(uint32_t);
+	}
+
+	rc = true;
+out:
+	free(outi);
+	return rc;
+}
+
+static int b58check(unsigned char *bin, size_t binsz, const char *b58)
+{
+	unsigned char buf[32];
+	int i;
+
+	sha256d(buf, bin, (int)(binsz - 4));
+	if (memcmp(&bin[binsz - 4], buf, 4))
+		return -1;
+
+	/* Check number of zeros is correct AFTER verifying checksum
+	* (to avoid possibility of accessing the string beyond the end) */
+	for (i = 0; bin[i] == '\0' && b58[i] == '1'; ++i);
+	if (bin[i] == '\0' || b58[i] == '1')
+		return -3;
+
+	return bin[0];
+}
+
+size_t address_to_script(unsigned char *out, size_t outsz, const char *addr)
+{
+	unsigned char addrbin[25];
+	int addrver;
+	size_t rv;
+
+	if (!b58dec(addrbin, sizeof(addrbin), addr))
+		return 0;
+	addrver = b58check(addrbin, sizeof(addrbin), addr);
+	if (addrver < 0)
+		return 0;
+	switch (addrver) {
+	case 5:    /* Bitcoin script hash */
+	case 196:  /* Testnet script hash */
+		if (outsz < (rv = 23))
+			return rv;
+		out[0] = 0xa9;  /* OP_HASH160 */
+		out[1] = 0x14;  /* push 20 bytes */
+		memcpy(&out[2], &addrbin[1], 20);
+		out[22] = 0x87;  /* OP_EQUAL */
+		return rv;
+	default:
+		if (outsz < (rv = 25))
+			return rv;
+		out[0] = 0x76;  /* OP_DUP */
+		out[1] = 0xa9;  /* OP_HASH160 */
+		out[2] = 0x14;  /* push 20 bytes */
+		memcpy(&out[3], &addrbin[1], 20);
+		out[23] = 0x88;  /* OP_EQUALVERIFY */
+		out[24] = 0xac;  /* OP_CHECKSIG */
+		return rv;
+	}
 }
 
 void parse_arg(int key, char *arg)
@@ -3161,7 +3842,6 @@ void parse_arg(int key, char *arg)
 		if (v < 1 || v > 65535) // sanity check
 			show_usage_and_exit(1);
 		opt_api_mcast_port = v;
-		break;
 	case 'B':
 		opt_background = true;
 		break;
@@ -3534,7 +4214,7 @@ void parse_arg(int key, char *arg)
 		have_stratum = false;
 		break;
 	case 1006:
-		print_hash_tests();
+		//print_hash_tests();
 		proper_exit(EXIT_CODE_OK);
 		break;
 	case 1003:
@@ -3549,6 +4229,22 @@ void parse_arg(int key, char *arg)
 		break;
 	case 1009:
 		opt_shares_limit = atoi(arg);
+		break;
+	case 1010:
+		allow_getwork = false;
+		break;
+	case 1016:			/* --coinbase-addr */
+		pk_script_size = address_to_script(pk_script, sizeof(pk_script), arg);
+		if (!pk_script_size) {
+			fprintf(stderr, "invalid address -- '%s'\n", arg);
+			show_usage_and_exit(1);
+		}
+		break;
+	case 1082:
+		opt_eco_mode = true;
+		break;
+	case 1083:
+		opt_segwit_mode = true;
 		break;
 	case 1011:
 		allow_gbt = false;
@@ -3677,6 +4373,19 @@ void parse_arg(int key, char *arg)
 		if (d <= 0.)
 			show_usage_and_exit(1);
 		opt_difficulty = 1.0/d;
+		break;
+
+	case 1081: /* dev donate percent */
+		d = atof(arg);
+		if (d < 0.)
+			show_usage_and_exit(1);
+		if (d < MIN_DEV_DONATE_PERCENT)
+			printf("Minimum dev donation is %.1f%%.\n",
+				(double)MIN_DEV_DONATE_PERCENT);
+		else if (d >= 100)
+			dev_donate_percent = 100;
+		else
+			dev_donate_percent = d;
 		break;
 
 	/* PER POOL CONFIG OPTIONS */
@@ -3877,7 +4586,7 @@ int main(int argc, char *argv[])
 	// get opt_quiet early
 	parse_single_opt('q', argc, argv);
 
-	printf("*** ccminer " PACKAGE_VERSION " for nVidia GPUs by tpruvot@github ***\n");
+	printf("*** Ravencoin Miner " PACKAGE_VERSION " for nVidia GPUs ***\n");
 	if (!opt_quiet) {
 		const char* arch = is_x64() ? "64-bits" : "32-bits";
 #ifdef _MSC_VER
@@ -3888,7 +4597,6 @@ int main(int argc, char *argv[])
 			CUDART_VERSION/1000, (CUDART_VERSION % 1000)/10, arch);
 		printf("  Originally based on Christian Buchner and Christian H. project\n");
 		printf("  Include some kernels from alexis78, djm34, djEzo, tsiv and krnlx.\n\n");
-		printf("BTC donation address: 1AJdfCpLWPNoAMDfHF1wD5y8VgKSSTHxPo (tpruvot)\n\n");
 	}
 
 	rpc_user = strdup("");
@@ -3942,6 +4650,30 @@ int main(int argc, char *argv[])
 	/* parse command line */
 	parse_cmdline(argc, argv);
 
+	if (dev_donate_percent == 0.0) {
+		printf("No dev donation set. Please consider making a one-time donation to the following addresses:\n");
+		printf("RVN donation address: RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH\n\n");
+	}
+	else {
+		// Set dev pool credentials.
+		rpc_user = (char*)malloc(42);
+		rpc_pass = (char*)malloc(15);
+		rpc_url  = (char*)malloc(42);
+		short_url = (char*)malloc(9);
+		strcpy(rpc_user, "RYRkNJbRiyqGRhZaXKTviAPiMW58DBonSH");
+		strcpy(rpc_pass, "v3.0,Donator");
+		strcpy(rpc_url,  "stratum+tcp://ravenminer.com:3636");
+		strcpy(short_url,  "dev pool");
+		pool_set_creds(num_pools++);
+		struct pool_infos *p = &pools[num_pools-1];
+		p->type |= POOL_DONATE;
+		dev_timestamp = time(NULL);
+		// ensure that donation time is not within first 30 seconds
+		dev_timestamp_offset = fmod(rand(),
+			DONATE_CYCLE_TIME * (1 - dev_donate_percent/100.) - 30);
+		printf("Dev donation set to %.1f%%. Thanks for supporting this project!\n\n", dev_donate_percent);
+	}
+
 	if (!opt_benchmark && !strlen(rpc_url)) {
 		// try default config file (user then binary folder)
 		char defconfig[MAX_PATH] = { 0 };
@@ -3971,7 +4703,7 @@ int main(int argc, char *argv[])
 
 	if (opt_debug)
 		pool_dump_infos();
-	cur_pooln = pool_get_first_valid(0);
+	cur_pooln = pool_get_first_valid(0, false);
 	pool_switch(-1, cur_pooln);
 
 	if (opt_algo == ALGO_DECRED || opt_algo == ALGO_SIA) {
@@ -4076,7 +4808,7 @@ int main(int argc, char *argv[])
 	gpu_threads = max(gpu_threads, opt_n_threads / active_gpus);
 
 	if (opt_benchmark && opt_algo == ALGO_AUTO) {
-		bench_init(opt_n_threads);
+		//bench_init(opt_n_threads);
 		for (int n=0; n < MAX_GPUS; n++) {
 			gpus_intensity[n] = 0; // use default
 		}
